@@ -1,18 +1,21 @@
-ï»¿#include "C_CombatSessionComponent.h"
+#include "C_CombatSessionComponent.h"
 
 #include <unordered_map>
 #include <algorithm>
 #include <cmath>
+#include <string>
 
 #include "Runtime/Scripting/ScriptFactory.h"
 #include "Runtime/Foundation/Logger.h"
 #include "Runtime/ECS/World.h"
+#include "Runtime/ECS/GameObject.h"
 #include "Runtime/ECS/Components/IDComponent.h"
 #include "Runtime/Gameplay/Combat/HealthComponent.h"
 #include "Runtime/Gameplay/Combat/AttackDriverComponent.h"
 #include "Runtime/Gameplay/Animation/AdvancedAnimationComponent.h"
 #include "Runtime/Physics/Components/Phy_CCTComponent.h"
 #include "Runtime/ECS/Components/TransformComponent.h"
+//TODO : Include È®ÀÎÇØ¾ßÇÔ
 
 #include "C_CombatContracts.h"
 #include "C_CombatEventBus.h"
@@ -27,8 +30,22 @@ namespace Alice
 {
     struct C_CombatSessionComponent::SessionState
     {
+        struct AnimOverrideState
+        {
+            bool saved = false;
+            AdvancedAnimLayer savedBase{};
+            bool overrideActive = false;
+            bool blending = false;
+            bool blendingToOverride = false;
+            float blendTimer = 0.0f;
+            std::string overrideClip{};
+            bool overrideLoop = false;
+        };
+
         Combat::Fighter player{};
         Combat::Fighter boss{};
+        Combat::FighterSnapshot playerSnapshot{};
+        Combat::FighterSnapshot bossSnapshot{};
         Combat::ActionFsm playerFsm{};
         Combat::ActionFsm bossFsm{};
         Combat::CombatEventBus bus{};
@@ -37,15 +54,29 @@ namespace Alice
         std::unordered_map<EntityId, Combat::Fighter*> fighterMap;
         Combat::ActionState prevPlayerState = Combat::ActionState::Idle;
         Combat::ActionState prevBossState = Combat::ActionState::Idle;
+        AnimOverrideState playerAnim{};
+        AnimOverrideState bossAnim{};
+        float playerMoveBlend = 0.0f;
+        float bossMoveBlend = 0.0f;
+        bool playerLockOnActive = false;
+        EntityId playerLockOnTarget = InvalidEntityId;
 
         void Init()
         {
             fighterMap.clear();
             player = Combat::Fighter{};
             boss = Combat::Fighter{};
+            playerSnapshot = Combat::FighterSnapshot{};
+            bossSnapshot = Combat::FighterSnapshot{};
             playerFsm.Reset();
             bossFsm.Reset();
             bus.ClearAll();
+            playerAnim = {};
+            bossAnim = {};
+            playerMoveBlend = 0.0f;
+            bossMoveBlend = 0.0f;
+            playerLockOnActive = false;
+            playerLockOnTarget = InvalidEntityId;
         }
     };
 
@@ -96,6 +127,38 @@ namespace Alice
         return a.part < b.part;
     }
 
+    struct MoveBasis
+    {
+        bool valid = false;
+        float forwardX = 0.0f;
+        float forwardZ = 1.0f;
+        float rightX = 1.0f;
+        float rightZ = 0.0f;
+    };
+
+    static MoveBasis BuildYawBasis(float yawRad)
+    {
+        MoveBasis basis{};
+        basis.forwardX = std::sin(yawRad);
+        basis.forwardZ = std::cos(yawRad);
+        basis.rightX = std::cos(yawRad);
+        basis.rightZ = -std::sin(yawRad);
+        basis.valid = true;
+        return basis;
+    }
+
+    static EntityId ResolvePrimaryCamera(World& world)
+    {
+        for (auto&& [entityId, cam] : world.GetComponents<CameraComponent>())
+        {
+            if (cam.primary)
+                return entityId;
+        }
+
+        auto go = world.FindGameObject("MainCamera");
+        return go.IsValid() ? go.id() : InvalidEntityId;
+    }
+
     static void UpdateHealthHitInfo(World& world,
                                     const Combat::HitEvent& hit,
                                     const Combat::ResolveOutput& resolved,
@@ -130,21 +193,6 @@ namespace Alice
             hc->dodgeAvoidedThisFrame = true;
     }
 
-    static Combat::ActionFlags BuildFlagsFromSensors(const Combat::Sensors& sensors,
-                                                     Combat::ActionState state)
-    {
-        Combat::ActionFlags flags{};
-        flags.hitActive = sensors.attackWindowActive;
-        flags.guardActive = sensors.guardWindowActive;
-        flags.invulnActive = sensors.dodgeWindowActive || sensors.invulnActive;
-        flags.parryWindowActive = false;
-        flags.canBeInterrupted = (state != Combat::ActionState::Dodge)
-            && (state != Combat::ActionState::Hitstun)
-            && (state != Combat::ActionState::Groggy)
-            && (state != Combat::ActionState::Dead);
-        return flags;
-    }
-
     EntityId C_CombatSessionComponent::ResolveEntity(uint64_t guid) const
     {
         if (guid == 0)
@@ -152,6 +200,14 @@ namespace Alice
         if (!GetWorld())
             return InvalidEntityId;
         return GetWorld()->FindEntityByGuid(guid);
+    }
+
+    EntityId C_CombatSessionComponent::ResolveEntityByName(const std::string& name) const
+    {
+        if (name.empty() || !GetWorld())
+            return InvalidEntityId;
+        auto go = GetWorld()->FindGameObject(name);
+        return go.IsValid() ? go.id() : InvalidEntityId;
     }
 
     void C_CombatSessionComponent::Start()
@@ -194,17 +250,33 @@ namespace Alice
             return;
 
         World& world = *GetWorld();
-        const EntityId playerId = ResolveEntity(m_playerGuid);
-        const EntityId bossId = ResolveEntity(m_bossGuid);
+        EntityId playerId = ResolveEntity(m_playerGuid);
+        EntityId bossId = ResolveEntity(m_bossGuid);
+        if (playerId == InvalidEntityId && m_autoResolveByName)
+            playerId = ResolveEntityByName(m_playerName);
+        if (bossId == InvalidEntityId && m_autoResolveByName)
+            bossId = ResolveEntityByName(m_bossName);
         if (playerId == InvalidEntityId || bossId == InvalidEntityId)
+        {
+            if (m_enableLogs)
+            {
+                ALICE_LOG_WARN("[CombatSession] Update skipped: player=%llu boss=%llu (guid=%llu/%llu name=%s/%s)",
+                    static_cast<unsigned long long>(playerId),
+                    static_cast<unsigned long long>(bossId),
+                    static_cast<unsigned long long>(m_playerGuid),
+                    static_cast<unsigned long long>(m_bossGuid),
+                    m_playerName.c_str(),
+                    m_bossName.c_str());
+            }
             return;
+        }
 
         m_state->player.id = playerId;
         m_state->player.team = Combat::Team::Player;
-        m_state->player.canBeHitstunned = true;
+        m_state->player.canBeHitstunned = m_playerCanBeHitstunned;
         m_state->boss.id = bossId;
         m_state->boss.team = Combat::Team::Enemy;
-        m_state->boss.canBeHitstunned = false;
+        m_state->boss.canBeHitstunned = m_bossCanBeHitstunned;
 
         m_state->fighterMap.clear();
         m_state->fighterMap[playerId] = &m_state->player;
@@ -224,6 +296,72 @@ namespace Alice
                 bossIntent = brain->Think(deltaTime, playerId);
         }
 
+        constexpr float kDegToRad = 0.01745329252f;
+
+        const EntityId cameraId = ResolvePrimaryCamera(world);
+        auto* camFollow = (cameraId != InvalidEntityId) ? world.GetComponent<CameraFollowComponent>(cameraId) : nullptr;
+        auto* camLookAt = (cameraId != InvalidEntityId) ? world.GetComponent<CameraLookAtComponent>(cameraId) : nullptr;
+        auto* camTr = (cameraId != InvalidEntityId) ? world.GetComponent<TransformComponent>(cameraId) : nullptr;
+
+        MoveBasis camBasis{};
+        if (cameraId != InvalidEntityId)
+        {
+            float yawRad = 0.0f;
+            bool hasYaw = false;
+            if (camFollow && camFollow->enabled)
+            {
+                yawRad = camFollow->yawDeg * kDegToRad;
+                hasYaw = true;
+            }
+            else if (camTr)
+            {
+                yawRad = camTr->rotation.y;
+                hasYaw = true;
+            }
+            if (hasYaw)
+                camBasis = BuildYawBasis(yawRad);
+        }
+
+        const bool canLockOn = (camFollow && camFollow->enableLockOn);
+        if (playerIntent.lockOnToggle && canLockOn)
+        {
+            if (m_state->playerLockOnActive)
+            {
+                m_state->playerLockOnActive = false;
+                m_state->playerLockOnTarget = InvalidEntityId;
+            }
+            else
+            {
+                m_state->playerLockOnActive = true;
+                m_state->playerLockOnTarget = bossId;
+            }
+        }
+
+        if (m_state->playerLockOnActive)
+            m_state->playerLockOnTarget = bossId;
+
+        if (camFollow)
+        {
+            camFollow->lockOnActive = m_state->playerLockOnActive;
+            if (m_state->playerLockOnActive)
+            {
+                camFollow->lockOnTargetId = m_state->playerLockOnTarget;
+                camFollow->mode = 2;
+            }
+            else
+            {
+                camFollow->lockOnTargetId = InvalidEntityId;
+                camFollow->mode = 0;
+            }
+        }
+
+        if (camLookAt)
+        {
+            camLookAt->enabled = m_state->playerLockOnActive;
+            if (m_state->playerLockOnActive)
+                camLookAt->targetName = m_bossName.empty() ? std::string("Enemy") : m_bossName;
+        }
+
         Combat::Sensors sPlayer = m_state->player.BuildSensors(world, bossId, deltaTime);
         Combat::Sensors sBoss = m_state->boss.BuildSensors(world, playerId, deltaTime);
 
@@ -234,26 +372,25 @@ namespace Alice
         const auto& eBoss = m_state->bus.PeekDeferred(bossId);
 
         auto outPlayer = m_state->playerFsm.Update(playerId, playerIntent, sPlayer, ePlayer, deltaTime);
-        std::vector<Combat::CombatEvent> bossEvents;
-        bossEvents.reserve(eBoss.size());
-        for (const auto& ev : eBoss)
-        {
-            if (ev.type == Combat::CombatEventType::OnHit)
-                continue;
-            bossEvents.push_back(ev);
-        }
-        auto outBoss = m_state->bossFsm.Update(bossId, bossIntent, sBoss, bossEvents, deltaTime);
+        auto outBoss = m_state->bossFsm.Update(bossId, bossIntent, sBoss, eBoss, deltaTime);
 
         m_state->player.state = outPlayer.state;
         m_state->player.flags = outPlayer.flags;
         m_state->boss.state = outBoss.state;
         m_state->boss.flags = outBoss.flags;
+        m_state->playerSnapshot = m_state->player.Snapshot();
+        m_state->bossSnapshot = m_state->boss.Snapshot();
 
         m_state->bus.ClearDeferred(playerId);
         m_state->bus.ClearDeferred(bossId);
 
-        auto ApplyMove = [&](const std::vector<Combat::Command>& cmds)
+        auto ApplyMove = [&](EntityId entityId,
+                             const Combat::Intent& intent,
+                             const std::vector<Combat::Command>& cmds)
         {
+            constexpr float kRadToDeg = 57.2957795f;
+            const float offsetRad = m_rotationOffsetDeg * kDegToRad;
+
             for (const auto& cmd : cmds)
             {
                 if (cmd.type != Combat::CommandType::RequestMove)
@@ -261,9 +398,26 @@ namespace Alice
                 const auto payload = std::get<Combat::CmdRequestMove>(cmd.payload);
                 auto* cct = world.GetComponent<Phy_CCTComponent>(payload.target);
                 if (!cct)
+                {
+                    if (m_enableLogs)
+                    {
+                        ALICE_LOG_WARN("[CombatSession] Missing CCT on entity=%llu",
+                            static_cast<unsigned long long>(payload.target));
+                    }
                     continue;
-                float dx = payload.move.x;
-                float dz = payload.move.y;
+                }
+                float inputX = payload.move.x;
+                float inputZ = payload.move.y;
+                float dx = inputX;
+                float dz = inputZ;
+                const bool isPlayer = (entityId == playerId);
+
+                if (isPlayer && payload.useCameraRelative && camBasis.valid)
+                {
+                    dx = camBasis.rightX * inputX + camBasis.forwardX * inputZ;
+                    dz = camBasis.rightZ * inputX + camBasis.forwardZ * inputZ;
+                }
+
                 const float len = std::sqrt(dx * dx + dz * dz);
                 if (len > 0.0001f)
                 {
@@ -273,22 +427,91 @@ namespace Alice
                 cct->desiredVelocity.x = dx * payload.speed;
                 cct->desiredVelocity.z = dz * payload.speed;
                 cct->desiredVelocity.y = 0.0f;
+                if (m_enableLogs && (dx != 0.0f || dz != 0.0f))
+                {
+                    ALICE_LOG_INFO("[CombatSession] Move entity=%llu dir(%.2f,%.2f) speed=%.2f",
+                        static_cast<unsigned long long>(entityId),
+                        dx, dz, payload.speed);
+                }
+
+                if (payload.faceMove && (dx != 0.0f || dz != 0.0f))
+                {
+                    if (auto* tr = world.GetComponent<TransformComponent>(entityId))
+                    {
+                        const float yawRad = std::atan2(dx, dz) + offsetRad;
+                        tr->SetRotation(0.0f, yawRad * kRadToDeg, 0.0f);
+                    }
+                }
             }
         };
-        ApplyMove(outPlayer.commands);
-        ApplyMove(outBoss.commands);
+        ApplyMove(playerId, playerIntent, outPlayer.commands);
+        ApplyMove(bossId, bossIntent, outBoss.commands);
 
-        auto ApplyAnimByState = [&](EntityId entityId, Combat::ActionState curr, Combat::ActionState& prev) {
-            if (curr == prev)
+        auto StopIfNotMoving = [&](EntityId entityId, Combat::ActionState state)
+        {
+            if (state == Combat::ActionState::Move || state == Combat::ActionState::Dodge)
                 return;
+            auto* cct = world.GetComponent<Phy_CCTComponent>(entityId);
+            if (!cct)
+                return;
+            cct->desiredVelocity.x = 0.0f;
+            cct->desiredVelocity.z = 0.0f;
+            cct->desiredVelocity.y = 0.0f;
+        };
+        StopIfNotMoving(playerId, outPlayer.state);
+        StopIfNotMoving(bossId, outBoss.state);
 
+        if (m_enableLogs)
+        {
+            ALICE_LOG_INFO("[CombatSession] Player state=%u cmds=%zu",
+                static_cast<unsigned>(outPlayer.state),
+                outPlayer.commands.size());
+        }
+
+        auto ApplyTraceCommands = [&](const std::vector<Combat::Command>& cmds)
+        {
+            std::vector<Combat::Command> traceCmds;
+            for (const auto& cmd : cmds)
+            {
+                if (cmd.type == Combat::CommandType::EnableTrace ||
+                    cmd.type == Combat::CommandType::DisableTrace)
+                {
+                    traceCmds.push_back(cmd);
+                }
+            }
+            if (!traceCmds.empty())
+                m_state->apply.ApplyImmediate(world, m_state->fighterMap, m_state->bus, traceCmds, true);
+        };
+        ApplyTraceCommands(outPlayer.commands);
+        ApplyTraceCommands(outBoss.commands);
+
+        auto SmoothApproach = [&](float current, float target, float speed, float dt) {
+            const float t = std::clamp(speed * dt, 0.0f, 1.0f);
+            return current + (target - current) * t;
+        };
+
+        auto ApplyAnimByState = [&](EntityId entityId,
+                                    Combat::ActionState curr,
+                                    Combat::ActionState& prev,
+                                    SessionState::AnimOverrideState& animState,
+                                    float& moveBlend) {
             auto* anim = world.GetComponent<AdvancedAnimationComponent>(entityId);
+            if (!anim)
+                anim = &world.AddComponent<AdvancedAnimationComponent>(entityId);
             auto* driver = world.GetComponent<AttackDriverComponent>(entityId);
             if (!anim || !driver)
             {
                 prev = curr;
                 return;
             }
+
+            anim->enabled = true;
+            anim->playing = true;
+            anim->upper.enabled = false;
+            anim->additive.enabled = false;
+            anim->ik.enabled = false;
+            for (auto& ik : anim->ikChains)
+                ik.enabled = false;
 
             auto resolveClipByType = [&](AttackDriverNotifyType type) -> std::string {
                 for (const auto& clip : driver->clips)
@@ -310,10 +533,21 @@ namespace Alice
                 return {};
             };
 
+            auto ResolveOverrideSpeed = [&](EntityId targetId,
+                                            Combat::ActionState state,
+                                            const std::string& name) -> float
+            {
+                if (state != Combat::ActionState::Attack)
+                    return 1.0f;
+                if (targetId != playerId)
+                    return 1.0f;
+                if (m_attackSlowClipName.empty() || name != m_attackSlowClipName)
+                    return 1.0f;
+                return std::max(0.0f, m_attackSlowSpeed);
+            };
+
             std::string clipName;
             bool loop = false;
-            bool immediate = true;
-
             if (curr == Combat::ActionState::Attack)
             {
                 clipName = resolveClipByType(AttackDriverNotifyType::Attack);
@@ -326,25 +560,166 @@ namespace Alice
             {
                 clipName = resolveClipByType(AttackDriverNotifyType::Guard);
                 loop = true;
-                immediate = false;
             }
 
-            if (!clipName.empty())
+            const bool wantsOverride = !clipName.empty()
+                && (curr == Combat::ActionState::Attack
+                    || curr == Combat::ActionState::Dodge
+                    || curr == Combat::ActionState::Guard);
+
+            const bool isLocomotion = (curr == Combat::ActionState::Idle || curr == Combat::ActionState::Move);
+            if (isLocomotion && !animState.overrideActive && !m_idleClip.empty())
             {
-                anim->enabled = true;
-                anim->playing = true;
-                anim->base.clipA = clipName;
+                const float targetBlend = (curr == Combat::ActionState::Move && !m_moveClip.empty()) ? 1.0f : 0.0f;
+                moveBlend = SmoothApproach(moveBlend, targetBlend, m_moveBlendSpeed, deltaTime);
+
                 anim->base.autoAdvance = true;
-                anim->base.loopA = loop;
-                if (immediate)
-                    anim->base.timeA = 0.0f;
+                anim->base.clipA = m_idleClip;
+                anim->base.clipB = m_moveClip.empty() ? m_idleClip : m_moveClip;
+                anim->base.loopA = true;
+                anim->base.loopB = true;
+                anim->base.speedA = 1.0f;
+                anim->base.speedB = 1.0f;
+                anim->base.blend01 = moveBlend;
             }
 
+            const float overrideSpeed = ResolveOverrideSpeed(entityId, curr, clipName);
+
+            auto BeginBlendToOverride = [&](const std::string& nextClip, bool nextLoop) {
+                if (!animState.overrideActive)
+                {
+                    animState.savedBase = anim->base;
+                    animState.saved = true;
+                }
+
+                animState.overrideActive = true;
+                animState.overrideClip = nextClip;
+                animState.overrideLoop = nextLoop;
+
+                if (m_animBlendSec <= 0.0f)
+                {
+                    anim->base.autoAdvance = true;
+                    anim->base.clipA = nextClip;
+                    anim->base.clipB = nextClip;
+                    anim->base.timeA = 0.0f;
+                    anim->base.timeB = 0.0f;
+                    anim->base.speedA = overrideSpeed;
+                    anim->base.speedB = overrideSpeed;
+                    anim->base.loopA = nextLoop;
+                    anim->base.loopB = nextLoop;
+                    anim->base.blend01 = 0.0f;
+                    animState.blending = false;
+                    animState.blendingToOverride = true;
+                    return;
+                }
+
+                animState.blending = true;
+                animState.blendingToOverride = true;
+                animState.blendTimer = 0.0f;
+
+                anim->base.autoAdvance = true;
+                anim->base.clipB = nextClip;
+                anim->base.timeB = 0.0f;
+                anim->base.speedB = overrideSpeed;
+                anim->base.loopB = nextLoop;
+                anim->base.blend01 = 0.0f;
+            };
+
+            auto BeginBlendToSaved = [&]() {
+                if (!animState.saved)
+                {
+                    animState.overrideActive = false;
+                    animState.overrideClip.clear();
+                    animState.blending = false;
+                    return;
+                }
+
+                if (m_animBlendSec <= 0.0f)
+                {
+                    anim->base = animState.savedBase;
+                    anim->base.timeA = 0.0f;
+                    anim->base.timeB = 0.0f;
+                    animState.overrideActive = false;
+                    animState.overrideClip.clear();
+                    animState.saved = false;
+                    animState.blending = false;
+                    return;
+                }
+
+                animState.blending = true;
+                animState.blendingToOverride = false;
+                animState.blendTimer = 0.0f;
+
+                anim->base.autoAdvance = true;
+                anim->base.clipB = animState.savedBase.clipA;
+                anim->base.timeB = 0.0f;
+                anim->base.speedB = animState.savedBase.speedA;
+                anim->base.loopB = animState.savedBase.loopA;
+                anim->base.blend01 = 0.0f;
+            };
+
+            auto StepBlend = [&]() {
+                if (!animState.blending || m_animBlendSec <= 0.0f)
+                    return;
+
+                animState.blendTimer += deltaTime;
+                float alpha = animState.blendTimer / m_animBlendSec;
+                if (alpha > 1.0f)
+                    alpha = 1.0f;
+
+                anim->base.blend01 = alpha;
+
+                if (alpha >= 1.0f)
+                {
+                    if (animState.blendingToOverride)
+                    {
+                        anim->base.clipA = animState.overrideClip;
+                        anim->base.timeA = anim->base.timeB;
+                        anim->base.speedA = anim->base.speedB;
+                        anim->base.loopA = animState.overrideLoop;
+                        anim->base.clipB = animState.overrideClip;
+                        anim->base.timeB = anim->base.timeA;
+                        anim->base.blend01 = 0.0f;
+                        animState.blending = false;
+                    }
+                    else
+                    {
+                        anim->base = animState.savedBase;
+                        anim->base.timeA = 0.0f;
+                        anim->base.timeB = 0.0f;
+                        animState.overrideActive = false;
+                        animState.overrideClip.clear();
+                        animState.saved = false;
+                        animState.blending = false;
+                    }
+                }
+            };
+
+            if (wantsOverride)
+            {
+                const bool clipChanged = !animState.overrideActive
+                    || animState.overrideClip != clipName
+                    || animState.overrideLoop != loop;
+                if (clipChanged)
+                    BeginBlendToOverride(clipName, loop);
+            }
+            else if (animState.overrideActive)
+            {
+                if (!animState.blending || animState.blendingToOverride)
+                    BeginBlendToSaved();
+            }
+
+            StepBlend();
+            if (animState.overrideActive && !animState.blending)
+            {
+                anim->base.speedA = overrideSpeed;
+                anim->base.speedB = overrideSpeed;
+            }
             prev = curr;
         };
 
-        ApplyAnimByState(playerId, outPlayer.state, m_state->prevPlayerState);
-        ApplyAnimByState(bossId, outBoss.state, m_state->prevBossState);
+        ApplyAnimByState(playerId, outPlayer.state, m_state->prevPlayerState, m_state->playerAnim, m_state->playerMoveBlend);
+        ApplyAnimByState(bossId, outBoss.state, m_state->prevBossState, m_state->bossAnim, m_state->bossMoveBlend);
     }
 
     void C_CombatSessionComponent::PostCombatUpdate(float deltaTime)
@@ -353,17 +728,21 @@ namespace Alice
             return;
 
         World& world = *GetWorld();
-        const EntityId playerId = ResolveEntity(m_playerGuid);
-        const EntityId bossId = ResolveEntity(m_bossGuid);
+        EntityId playerId = ResolveEntity(m_playerGuid);
+        EntityId bossId = ResolveEntity(m_bossGuid);
+        if (playerId == InvalidEntityId && m_autoResolveByName)
+            playerId = ResolveEntityByName(m_playerName);
+        if (bossId == InvalidEntityId && m_autoResolveByName)
+            bossId = ResolveEntityByName(m_bossName);
         if (playerId == InvalidEntityId || bossId == InvalidEntityId)
             return;
 
         m_state->player.id = playerId;
         m_state->player.team = Combat::Team::Player;
-        m_state->player.canBeHitstunned = true;
+        m_state->player.canBeHitstunned = m_playerCanBeHitstunned;
         m_state->boss.id = bossId;
         m_state->boss.team = Combat::Team::Enemy;
-        m_state->boss.canBeHitstunned = false;
+        m_state->boss.canBeHitstunned = m_bossCanBeHitstunned;
 
         m_state->bus.ClearFrame();
         if (world.HasFrameCombatHits())
@@ -393,22 +772,13 @@ namespace Alice
             }
         }
 
-        Combat::Sensors sPlayer = m_state->player.BuildSensors(world, bossId, deltaTime);
-        Combat::Sensors sBoss = m_state->boss.BuildSensors(world, playerId, deltaTime);
-        m_state->player.hp = sPlayer.hp;
-        m_state->boss.hp = sBoss.hp;
-        m_state->player.flags = BuildFlagsFromSensors(sPlayer, m_state->player.state);
-        m_state->boss.flags = BuildFlagsFromSensors(sBoss, m_state->boss.state);
-
         bool bossGroggyTriggered = false;
         for (const auto& hit : m_state->bus.Hits())
         {
-            Combat::FighterSnapshot attacker = (hit.attackerOwner == playerId)
-                ? m_state->player.Snapshot()
-                : m_state->boss.Snapshot();
-            Combat::FighterSnapshot victim = (hit.victimOwner == playerId)
-                ? m_state->player.Snapshot()
-                : m_state->boss.Snapshot();
+            const Combat::FighterSnapshot& playerSnap = m_state->playerSnapshot;
+            const Combat::FighterSnapshot& bossSnap = m_state->bossSnapshot;
+            Combat::FighterSnapshot attacker = (hit.attackerOwner == playerId) ? playerSnap : bossSnap;
+            Combat::FighterSnapshot victim = (hit.victimOwner == playerId) ? playerSnap : bossSnap;
 
             auto resolved = m_state->resolver.ResolveOne(hit, attacker, victim);
 

@@ -1,4 +1,4 @@
-﻿#include "C_Fighter.h"
+#include "C_Fighter.h"
 
 #include <DirectXMath.h>
 #include <cmath>
@@ -20,6 +20,7 @@ namespace Alice::Combat
         s.stamina = stamina;
         s.moveSpeed = moveSpeed;
         s.targetId = targetId;
+    s.canBeHitstunned = canBeHitstunned;
 
         if (auto* cct = world.GetComponent<Phy_CCTComponent>(id))
         {
@@ -42,6 +43,9 @@ namespace Alice::Combat
             s.attackWindowActive = driver->attackActive;
             s.guardWindowActive = s.guardWindowActive || driver->guardActive;
             s.dodgeWindowActive = s.dodgeWindowActive || driver->dodgeActive;
+            s.attackStateDurationSec = (driver->attackStateDurationSec > 0.0f)
+                ? driver->attackStateDurationSec
+                : driver->attackStateDurationAutoSec;
         }
 
         const auto* selfTr = world.GetComponent<TransformComponent>(id);

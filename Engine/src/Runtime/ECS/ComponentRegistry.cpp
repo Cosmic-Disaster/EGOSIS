@@ -438,7 +438,8 @@ namespace Alice
 		rttr::registration::class_<AttackDriverComponent>("AttackDriverComponent")
 			.constructor<>()
 			.property("traceGuid", &AttackDriverComponent::traceGuid)
-			.property("clips", &AttackDriverComponent::clips);
+			.property("clips", &AttackDriverComponent::clips)
+			.property("attackStateDurationSec", &AttackDriverComponent::attackStateDurationSec);
 
 		// SocketDef / SocketComponent 등록 (씬 저장/로드 및 인스펙터)
 		rttr::registration::class_<SocketDef>("SocketDef")
@@ -499,6 +500,7 @@ namespace Alice
             .property("shoulderSide", &CameraFollowComponent::shoulderSide)
             .property("enableInput", &CameraFollowComponent::enableInput)
             .property("sensitivity", &CameraFollowComponent::sensitivity)
+            .property("invertMouse", &CameraFollowComponent::invertMouse)
             .property("yawDeg", &CameraFollowComponent::yawDeg)
             .property("pitchDeg", &CameraFollowComponent::pitchDeg)
             .property("pitchMinDeg", &CameraFollowComponent::pitchMinDeg)

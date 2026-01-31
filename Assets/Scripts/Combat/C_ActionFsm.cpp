@@ -1,4 +1,4 @@
-﻿#include "C_ActionFsm.h"
+#include "C_ActionFsm.h"
 
 #include <cmath>
 
@@ -22,6 +22,7 @@ namespace Alice::Combat
         m_state = ActionState::Idle;
         m_stateTime = 0.0f;
         m_attackCommitted = false;
+        m_prevHitActive = false;
     }
 
     void ActionFsm::Enter(ActionState next)
@@ -34,6 +35,7 @@ namespace Alice::Combat
                 m_attackCommitted = false;
             else
                 m_attackCommitted = false;
+            m_prevHitActive = false;
         }
     }
 
@@ -59,7 +61,8 @@ namespace Alice::Combat
 
         if (HasEvent(events, CombatEventType::OnHit) && m_state != ActionState::Dead)
         {
-            Enter(ActionState::Hitstun);
+            if (sensors.canBeHitstunned)
+                Enter(ActionState::Hitstun);
         }
 
         if (m_state != ActionState::Dead && m_state != ActionState::Hitstun && m_state != ActionState::Groggy)
@@ -68,7 +71,23 @@ namespace Alice::Combat
 
             if (m_state == ActionState::Attack)
             {
-                if (!m_attackCommitted)
+                if (sensors.attackStateDurationSec > 0.0f)
+                {
+                    if (m_stateTime >= sensors.attackStateDurationSec)
+                    {
+                        if (hasMove)
+                        {
+                            Enter(ActionState::Move);
+                            out.commands.push_back({ CommandType::RequestMove, CmdRequestMove{ self, intent.move, sensors.moveSpeed, true, true } });
+                        }
+                        else
+                        {
+                            Enter(ActionState::Idle);
+                            out.commands.push_back({ CommandType::RequestMove, CmdRequestMove{ self, {0.0f, 0.0f}, 0.0f, true, false } });
+                        }
+                    }
+                }
+                else if (!m_attackCommitted)
                 {
                     if (sensors.attackWindowActive)
                         m_attackCommitted = true;
@@ -131,6 +150,7 @@ namespace Alice::Combat
         }
 
         ActionFlags flags{};
+        // Flags are pass-through windows from sensors (single source of truth).
         flags.hitActive = sensors.attackWindowActive;
         flags.guardActive = sensors.guardWindowActive;
         flags.invulnActive = sensors.dodgeWindowActive || sensors.invulnActive;
@@ -149,6 +169,15 @@ namespace Alice::Combat
             flags.canBeInterrupted = false;
             if (m_stateTime > sensors.groggyDuration)
                 Enter(ActionState::Idle);
+        }
+
+        if (flags.hitActive != m_prevHitActive)
+        {
+            if (flags.hitActive)
+                out.commands.push_back({ CommandType::EnableTrace, CmdEnableTrace{ self } });
+            else
+                out.commands.push_back({ CommandType::DisableTrace, CmdDisableTrace{ self } });
+            m_prevHitActive = flags.hitActive;
         }
 
         out.state = m_state;
